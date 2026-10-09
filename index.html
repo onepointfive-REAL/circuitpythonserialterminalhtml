@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CircuitPython terminal</title>
+<link rel="stylesheet" href="./xterm.css">
+<style>
+  :root { --bg:#14181f; --panel:#1b212b; --line:#2a3340; --text:#d9e2ec; --dim:#7f8c9b;
+          --accent:#ff8a3d; --ok:#6fdc8c; --err:#ff6b6b; --mono:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,monospace; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; display: flex; flex-direction: column; }
+  header { background: var(--panel); border-bottom: 1px solid var(--line); padding: 8px 12px;
+           display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
+                   padding: 7px 12px; font: inherit; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--dim); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button.primary { background: var(--accent); color: #1a1006; border-color: var(--accent); font-weight: 600; }
+  button.primary.on { background: transparent; color: var(--accent); }
+  .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 4px; }
+  .status { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--dim); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); }
+  .dot.on { background: var(--ok); } .dot.wait { background: var(--accent); }
+  main { flex: 1; min-height: 0; padding: 8px 0 0 10px; }
+  #term { height: 100%; }
+  details { background: var(--panel); border-top: 1px solid var(--line); padding: 8px 12px; }
+  summary { cursor: pointer; color: var(--dim); }
+  .paste { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  textarea { width: 100%; height: 130px; resize: vertical; background: var(--bg); color: var(--text);
+             border: 1px solid var(--line); border-radius: 4px; padding: 8px; font: 13px var(--mono); }
+  .paste .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .paste label.chk { color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  #banner { display: none; background: var(--err); color: #200; padding: 8px 12px; }
+</style>
+</head>
+<body>
+<div id="banner">Web Serial isn't available. Use Chrome, Edge, or Opera on desktop (https, localhost, or a local file).</div>
+
+<header>
+  <button id="connect" class="primary">Connect</button>
+  <span class="sep"></span>
+  <button id="stop" disabled title="Ctrl+C: interrupt the running program">Stop (Ctrl+C)</button>
+  <button id="reload" disabled title="Ctrl+D at the >>> prompt: soft reboot, reruns code.py">Reload (Ctrl+D)</button>
+  <button id="paste" disabled title="Ctrl+E: paste mode for multi-line code">Paste mode (Ctrl+E)</button>
+  <button id="info" disabled title="Prints board and CircuitPython version">Board info</button>
+  <span class="sep"></span>
+  <select id="font" title="Font size" aria-label="Font size">
+    <option value="12">12 px</option><option value="14" selected>14 px</option>
+    <option value="16">16 px</option><option value="20">20 px</option>
+  </select>
+  <button id="save">Save log</button>
+  <button id="clear">Clear</button>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">Disconnected</span></div>
+</header>
+
+<main><div id="term"></div></main>
+
+<details>
+  <summary>Paste and run code</summary>
+  <div class="paste">
+    <textarea id="code" spellcheck="false" placeholder="import board&#10;import digitalio&#10;&#10;led = digitalio.DigitalInOut(board.LED)&#10;led.switch_to_output(True)"></textarea>
+    <div class="bar">
+      <button id="run" class="primary" disabled>Run in REPL</button>
+      <button id="loadFile">Load .py file</button>
+      <input type="file" id="file" accept=".py,.txt" hidden>
+      <label class="chk"><input type="checkbox" id="stopFirst" checked> Interrupt the running program first</label>
+    </div>
+  </div>
+</details>
+
+<script src="./xterm.js"></script>
+<script src="./addon-fit.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const CTRL_C = '\x03', CTRL_D = '\x04', CTRL_E = '\x05';
+
+  if (!('serial' in navigator)) { $('banner').style.display = 'block'; $('connect').disabled = true; }
+  if (typeof Terminal === 'undefined') { $('banner').textContent = 'Could not load xterm.js from the CDN. Check your internet connection.'; $('banner').style.display = 'block'; }
+
+  /* ---------- terminal ---------- */
+  const term = new Terminal({
+    fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--mono'),
+    fontSize: 14, cursorBlink: true, scrollback: 5000, convertEol: false,
+    theme: { background: '#14181f', foreground: '#d9e2ec', cursor: '#ff8a3d', selectionBackground: '#3a4a60' },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($('term'));
+  const refit = () => { try { fit.fit(); } catch {} };
+  new ResizeObserver(refit).observe($('term'));
+  refit();
+  term.focus();
+
+  // Ctrl+C copies when text is selected, otherwise it goes to the board. Ctrl+V pastes.
+  term.attachCustomKeyEventHandler(e => {
+    if (e.type !== 'keydown') return true;
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && e.key.toLowerCase() === 'c' && term.hasSelection()) {
+      navigator.clipboard.writeText(term.getSelection()); return false;
+    }
+    if (mod && e.key.toLowerCase() === 'v') return false; // let the browser paste event handle it
+    return true;
+  });
+
+  const note = (t, color = 33) => term.write(`\r\n\x1b[${color}m[${t}]\x1b[0m\r\n`);
+
+  /* ---------- state ---------- */
+  let port = null, reader = null, readDone = null;
+  let wantConnected = false, logText = '';
+  let chain = Promise.resolve();
+  let uiOn = false, busy = false;   // busy = locked while an interrupt-and-wait sequence runs
+
+  const INTERRUPT_WAIT = 2000;      // ms to wait after Ctrl+C before doing anything else
+  const ENTER_WAIT = 300;           // ms to let the prompt appear after pressing Enter
+  async function interruptAndPrompt() {
+    await sendText(CTRL_C + CTRL_C); await sleep(INTERRUPT_WAIT);
+    await sendText('\r'); await sleep(ENTER_WAIT);
+  }
+  function applyBusy() {
+    ['stop', 'reload', 'paste', 'info', 'run'].forEach(id => $(id).disabled = !uiOn || busy);
+    $('term').style.opacity = busy ? 0.6 : 1;
+  }
+  async function exclusive(fn) {
+    if (busy) return;
+    busy = true; applyBusy();
+    try { await fn(); } finally { busy = false; applyBusy(); term.focus(); }
+  }
+
+  function setUi(state, text) {
+    const on = state === 'on';
+    $('connect').textContent = wantConnected ? 'Disconnect' : 'Connect';
+    $('connect').classList.toggle('on', wantConnected);
+    $('dot').className = 'dot ' + (on ? 'on' : state === 'wait' ? 'wait' : '');
+    $('status').textContent = text;
+    uiOn = on; applyBusy();
+  }
+
+  /* ---------- connection ---------- */
+  async function openPort(p) {
+    try {
+      await p.open({ baudRate: 115200, bufferSize: 8192 }); // baud is ignored by USB CDC
+    } catch (e) {
+      note('Could not open port: ' + e.message + '. Close Mu, Thonny, or other serial apps and try again.', 31);
+      wantConnected = false; setUi('off', 'Disconnected'); return false;
+    }
+    port = p;
+    try { await port.setSignals({ dataTerminalReady: true, requestToSend: true }); } catch {}
+    setUi('on', 'Connected');
+    note('connected. Press Enter for a prompt, Ctrl+C to interrupt, Ctrl+D to reload');
+    readDone = readLoop();
+    await sleep(150);      // let the read loop spin up
+    sendText('\r');        // Enter, so the REPL prints a fresh prompt
+    return true;
+  }
+
+  async function readLoop() {
+    while (port && port.readable) {
+      reader = port.readable.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) {
+            term.write(value);
+            logText += dec.decode(value, { stream: true }).replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '').replace(/\r/g, '');
+          }
+        }
+      } catch { /* device went away */ }
+      finally { reader.releaseLock(); reader = null; }
+      break;
+    }
+  }
+
+  async function closePort() {
+    const p = port; port = null;
+    try { if (reader) await reader.cancel(); } catch {}
+    try { await readDone; } catch {}
+    try { if (p) await p.close(); } catch {}
+  }
+
+  async function connect() {
+    let p;
+    try { p = await navigator.serial.requestPort(); } catch { return; } // picker cancelled
+    wantConnected = true;
+    await openPort(p);
+  }
+
+  async function disconnect() {
+    wantConnected = false;
+    await closePort();
+    setUi('off', 'Disconnected');
+    note('disconnected');
+  }
+
+  $('connect').onclick = () => (wantConnected ? disconnect() : connect());
+
+  // CircuitPython re-enumerates after a hard reset or a mode change: wait and reconnect.
+  if ('serial' in navigator) {
+    navigator.serial.addEventListener('disconnect', async e => {
+      if (e.target !== port) return;
+      await closePort();
+      if (wantConnected) { setUi('wait', 'Waiting for board…'); note('board disconnected, waiting for it to come back', 33); }
+    });
+    navigator.serial.addEventListener('connect', async e => {
+      if (!wantConnected || port) return;
+      await sleep(400); // give the board a moment to finish booting
+      if (await openPort(e.target)) term.focus();
+    });
+  }
+
+  /* ---------- sending ---------- */
+  // Queue writes so keystrokes and pasted code never collide on the stream lock.
+  function sendBytes(bytes, chunk = 0, pause = 0) {
+    chain = chain.then(async () => {
+      if (!port || !port.writable) return;
+      const w = port.writable.getWriter();
+      try {
+        if (!chunk) await w.write(bytes);
+        else for (let i = 0; i < bytes.length; i += chunk) {
+          await w.write(bytes.subarray(i, i + chunk));
+          if (pause) await sleep(pause);
+        }
+      } catch (e) { note('write error: ' + e.message, 31); }
+      finally { w.releaseLock(); }
+    });
+    return chain;
+  }
+  const sendText = (s, chunk, pause) => sendBytes(enc.encode(s), chunk, pause);
+
+  // Everything typed in the terminal goes straight to the board (the REPL does its own line editing).
+  term.onData(d => { if (port && !busy) sendText(d); });
+
+  /* ---------- buttons ---------- */
+  $('stop').onclick = () => { sendText(CTRL_C); term.focus(); };
+  $('reload').onclick = () => { sendText(CTRL_D); term.focus(); };
+  $('paste').onclick = () => { sendText(CTRL_E); term.focus(); };
+  $('info').onclick = () => exclusive(async () => {
+    await interruptAndPrompt();
+    await sendText('import os; print(os.uname())\r');
+  });
+
+  $('run').onclick = () => {
+    const code = $('code').value.replace(/\r\n/g, '\n').replace(/\n+$/, '');
+    if (!code) return;
+    exclusive(async () => {
+      if ($('stopFirst').checked) await interruptAndPrompt();
+      await sendText(CTRL_E); await sleep(100);
+      await sendText(code.replace(/\n/g, '\r'), 128, 5);   // chunked so the board's buffer keeps up
+      await sendText(CTRL_D);
+    });
+  };
+
+  $('loadFile').onclick = () => $('file').click();
+  $('file').onchange = async e => {
+    const f = e.target.files[0];
+    if (f) $('code').value = await f.text();
+    e.target.value = '';
+  };
+
+  $('font').onchange = () => { term.options.fontSize = +$('font').value; refit(); };
+  $('clear').onclick = () => { term.clear(); logText = ''; term.focus(); };
+  $('save').onclick = () => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([logText], { type: 'text/plain' }));
+    a.download = `circuitpython-log-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+    a.click(); URL.revokeObjectURL(a.href);
+  };
+
+  setUi('off', 'Disconnected');
+  term.writeln('\x1b[2mCircuitPython terminal. Click Connect and pick your board (usually "CircuitPython CDC control").\x1b[0m');
+})();
+</script>
+</body>
+</html>
